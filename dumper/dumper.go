@@ -48,11 +48,13 @@ var (
 
 // Style dumping style
 type Style struct {
-	SortDirectives    bool
-	SpaceBeforeBlocks bool
-	StartIndent       int
-	Indent            int
-	Debug             bool
+	SortDirectives       bool
+	SpaceBeforeBlocks    bool
+	StartIndent          int
+	Indent               int
+	Debug                bool
+	DisableLuaFormatting bool
+	LuaFormatter         LuaFormatterFunc
 }
 
 // NewStyle create new style
@@ -69,12 +71,27 @@ func NewStyle() *Style {
 // Iterate interate the indentation for sub blocks
 func (s *Style) Iterate() *Style {
 	newStyle := &Style{
-		SortDirectives:    s.SortDirectives,
-		SpaceBeforeBlocks: s.SpaceBeforeBlocks,
-		StartIndent:       s.StartIndent + s.Indent,
-		Indent:            s.Indent,
+		SortDirectives:       s.SortDirectives,
+		SpaceBeforeBlocks:    s.SpaceBeforeBlocks,
+		StartIndent:          s.StartIndent + s.Indent,
+		Indent:               s.Indent,
+		Debug:                s.Debug,
+		DisableLuaFormatting: s.DisableLuaFormatting,
+		LuaFormatter:         s.LuaFormatter,
 	}
 	return newStyle
+}
+
+// WithLuaFormatting toggles Lua formatting during dump.
+func (s *Style) WithLuaFormatting(enabled bool) *Style {
+	s.DisableLuaFormatting = !enabled
+	return s
+}
+
+// WithLuaFormatter sets a custom Lua formatter implementation.
+func (s *Style) WithLuaFormatter(formatter LuaFormatterFunc) *Style {
+	s.LuaFormatter = formatter
+	return s
 }
 
 // DumpDirective convert a directive to a string
@@ -137,21 +154,12 @@ func DumpDirective(d config.IDirective, style *Style) string {
 
 // DumpBlock convert a directive to a string
 func DumpBlock(b config.IBlock, style *Style) string {
-	var buf bytes.Buffer
-
 	if b.GetCodeBlock() != "" {
-		luaLines := strings.Split(b.GetCodeBlock(), "\n")
-		for i, line := range luaLines {
-			buf.WriteString(fmt.Sprintf("%s%s", strings.Repeat(" ", style.StartIndent), line))
-			if i != len(luaLines)-1 {
-				buf.WriteString("\n")
-			}
-		}
-
-		return buf.String()
+		return DumpLuaBlock(b, style)
 	}
 
-	directives := b.GetDirectives()
+	var buf bytes.Buffer
+	directives := append([]config.IDirective(nil), b.GetDirectives()...)
 	if style.SortDirectives {
 		sort.SliceStable(directives, func(i, j int) bool {
 			return directives[i].GetName() < directives[j].GetName()
@@ -195,7 +203,7 @@ func WriteConfig(c *config.Config, style *Style, writeInclude bool) error {
 		for _, include := range includes {
 			i, ok := include.(*config.Include)
 			if !ok {
-				panic("bug in FindDirective")
+				return fmt.Errorf("include directive type mismatch: %T", include)
 			}
 
 			// no config parsed
@@ -220,9 +228,11 @@ func WriteConfig(c *config.Config, style *Style, writeInclude bool) error {
 	}
 	// create parent directories, if not exit
 	dir, _ := filepath.Split(c.FilePath)
-	err := os.MkdirAll(dir, 0755)
-	if err != nil {
-		return err
+	if dir != "" {
+		err := os.MkdirAll(dir, 0755)
+		if err != nil {
+			return err
+		}
 	}
 	return os.WriteFile(c.FilePath, []byte(DumpConfig(c, style)), 0644)
 }

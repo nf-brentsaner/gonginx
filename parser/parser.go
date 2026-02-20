@@ -18,6 +18,7 @@ type Option func(*Parser)
 type options struct {
 	parseInclude               bool
 	skipIncludeParsingErr      bool
+	includeCycleErr            bool
 	skipComments               bool
 	customDirectives           map[string]string
 	skipValidSubDirectiveBlock map[string]struct{}
@@ -28,6 +29,7 @@ func defaultOptions() options {
 	return options{
 		parseInclude:               false,
 		skipIncludeParsingErr:      false,
+		includeCycleErr:            false,
 		skipComments:               false,
 		customDirectives:           map[string]string{},
 		skipValidSubDirectiveBlock: map[string]struct{}{},
@@ -42,7 +44,8 @@ type Parser struct {
 	lexer             *lexer
 	currentToken      token.Token
 	followingToken    token.Token
-	parsedIncludes    map[*config.Include]*config.Config
+	parsedIncludes    map[string]*config.Config
+	includeStack      map[string]struct{}
 	statementParsers  map[string]func() (config.IDirective, error)
 	blockWrappers     map[string]func(*config.Directive) (config.IDirective, error)
 	directiveWrappers map[string]func(*config.Directive) (config.IDirective, error)
@@ -59,9 +62,15 @@ func WithSameOptions(p *Parser) Option {
 	}
 }
 
-func withParsedIncludes(parsedIncludes map[*config.Include]*config.Config) Option {
+func withParsedIncludes(parsedIncludes map[string]*config.Config) Option {
 	return func(p *Parser) {
 		p.parsedIncludes = parsedIncludes
+	}
+}
+
+func withIncludeStack(includeStack map[string]struct{}) Option {
+	return func(p *Parser) {
+		p.includeStack = includeStack
 	}
 }
 
@@ -75,6 +84,14 @@ func withConfigRoot(configRoot string) Option {
 func WithSkipIncludeParsingErr() Option {
 	return func(p *Parser) {
 		p.opts.skipIncludeParsingErr = true
+	}
+}
+
+// WithIncludeCycleErr returns an error when include cycle is detected.
+// Default behavior skips cyclic include branches.
+func WithIncludeCycleErr() Option {
+	return func(p *Parser) {
+		p.opts.includeCycleErr = true
 	}
 }
 
@@ -148,7 +165,8 @@ func NewParserFromLexer(lexer *lexer, opts ...Option) *Parser {
 	parser := &Parser{
 		lexer:          lexer,
 		opts:           defaultOptions(),
-		parsedIncludes: make(map[*config.Include]*config.Config),
+		parsedIncludes: make(map[string]*config.Config),
+		includeStack:   make(map[string]struct{}),
 		configRoot:     configRoot,
 	}
 
@@ -179,17 +197,38 @@ func (p *Parser) followingTokenIs(t token.Type) bool {
 }
 
 // Parse the gonginx.
-func (p *Parser) Parse() (*config.Config, error) {
+func (p *Parser) Parse() (_ *config.Config, err error) {
+	if p.file != nil {
+		defer func() {
+			closeErr := p.Close()
+			if closeErr == nil {
+				return
+			}
+
+			if err != nil {
+				err = errors.Join(err, closeErr)
+				return
+			}
+			err = closeErr
+		}()
+	}
+
 	parsedBlock, err := p.parseBlock(false, false)
 	if err != nil {
+		if p.lexer.Err != nil {
+			return nil, errors.Join(p.lexer.Err, err)
+		}
 		return nil, err
 	}
+	if p.lexer.Err != nil {
+		return nil, p.lexer.Err
+	}
+
 	c := &config.Config{
 		FilePath: p.lexer.file, //TODO: set filepath here,
 		Block:    parsedBlock,
 	}
-	err = p.Close()
-	return c, err
+	return c, nil
 }
 
 // ParseBlock parse a block statement
@@ -220,7 +259,9 @@ parsingLoop:
 				return nil, err
 			}
 			if s.GetBlock() == nil {
-				s.SetParent(s)
+				// Root-level leaf directives have no parent.
+				// Nested leaf directives get parent assignment when their containing block wrapper is processed.
+				s.SetParent(nil)
 			} else {
 				// each directive should have a parent directive, not a block
 				// find each directive in the block and set the parent directive
@@ -298,7 +339,12 @@ func (p *Parser) parseStatement(isSkipValidDirective bool) (config.IDirective, e
 				if err != nil {
 					return nil, err
 				}
-				return p.ParseInclude(include.(*config.Include))
+
+				inc, ok := include.(*config.Include)
+				if !ok {
+					return nil, fmt.Errorf("invalid include wrapper result type %T", include)
+				}
+				return p.ParseInclude(inc)
 			} else if dw, ok := p.directiveWrappers[d.Name]; ok {
 				return dw(d)
 			}
@@ -314,20 +360,70 @@ func (p *Parser) parseStatement(isSkipValidDirective bool) (config.IDirective, e
 			_, blockSkip2 := p.opts.skipValidSubDirectiveBlock[d.Name]
 			isSkipBlockSubDirective := blockSkip1 || blockSkip2 || isSkipValidDirective
 
+			// Special handling for *_by_lua_block directives
+			if strings.HasSuffix(d.Name, "_by_lua_block") {
+				// For Lua blocks, we need to capture the content without parsing it as nginx directives
+				b := &config.Block{
+					IsLuaBlock:  true,
+					Directives:  []config.IDirective{},
+					LiteralCode: "",
+				}
+
+				// Skip past the opening brace
+				p.nextToken()
+
+				// Collect all content until the matching closing brace
+				// We need to count braces to handle nested blocks within Lua code
+				braceCount := 1
+				var luaCode strings.Builder
+
+				for braceCount > 0 && !p.curTokenIs(token.EOF) {
+					if p.curTokenIs(token.BlockStart) {
+						braceCount++
+					} else if p.curTokenIs(token.BlockEnd) {
+						braceCount--
+						if braceCount == 0 {
+							// This is the closing brace of the Lua block
+							break
+						}
+					}
+
+					// Append token to Lua code if it's not the closing brace
+					if !(p.curTokenIs(token.BlockEnd) && braceCount == 0) {
+						luaCode.WriteString(p.currentToken.Literal)
+						// Add space between tokens for readability
+						if p.followingToken.Type != token.BlockEnd &&
+							p.followingToken.Type != token.Semicolon &&
+							p.followingToken.Type != token.EndOfLine {
+							luaCode.WriteString(" ")
+						}
+					}
+
+					p.nextToken()
+				}
+
+				b.LiteralCode = strings.TrimSpace(luaCode.String())
+				d.Block = b
+
+				// Use the appropriate wrapper based on the directive name
+				if strings.HasSuffix(d.Name, "_by_lua_block") {
+					return p.blockWrappers["_by_lua_block"](d)
+				}
+				return d, nil
+			}
+
 			b, err := p.parseBlock(true, isSkipBlockSubDirective)
 			if err != nil {
 				return nil, err
 			}
 			d.Block = b
 
-			if strings.HasSuffix(d.Name, "_by_lua_block") {
-				return p.blockWrappers["_by_lua_block"](d)
-			}
-
 			if bw, ok := p.blockWrappers[d.Name]; ok {
 				return bw(d)
 			}
 			return d, nil
+		} else if p.currentToken.Is(token.EndOfLine) {
+			continue
 		} else {
 			return nil, fmt.Errorf("unexpected token %s (%s) on line %d, column %d", p.currentToken.Type.String(), p.currentToken.Literal, p.currentToken.Line, p.currentToken.Column)
 		}
@@ -336,63 +432,87 @@ func (p *Parser) parseStatement(isSkipValidDirective bool) (config.IDirective, e
 
 // ParseInclude just parse include confs
 func (p *Parser) ParseInclude(include *config.Include) (config.IDirective, error) {
-	var filteredIncludes []string
-
 	if p.opts.parseInclude {
 		includePath := include.IncludePath
 		if !filepath.IsAbs(includePath) {
 			includePath = filepath.Join(p.configRoot, include.IncludePath)
 		}
+		hasWildcard := hasGlobMeta(includePath)
 		includePaths, err := filepath.Glob(includePath)
 		if err != nil && !p.opts.skipIncludeParsingErr {
 			return nil, err
 		}
-		// NGINX globbing and filepath.Glob globbing behave slightly differently.
-		// https://github.com/tufanbarisyildirim/gonginx/issues/64
-		if len(includePaths) == 0 {
-			return nil, nil
-		}
-		filteredIncludes = make([]string, 0, len(includePaths))
-		for _, origIncludePath := range includePaths {
-			// TODO: Does NGINX on Windows skip dot-prefix, or does it skip
-			// 	  syscall.FILE_ATTRIBUTE_HIDDEN?
-			if !strings.HasPrefix(origIncludePath, ".") {
-				filteredIncludes = append(filteredIncludes, origIncludePath)
+
+		for _, matchedPath := range includePaths {
+			// Keep parity with nginx include globbing: wildcard includes ignore hidden file matches.
+			// Explicit hidden path segments should still be allowed (e.g. ".conf.d/*").
+			if hasWildcard && pathHasHiddenBaseName(matchedPath) {
+				continue
 			}
-		}
-		if len(filteredIncludes) == 0 {
-			return nil, nil
-		}
-		for _, includePath := range filteredIncludes {
-			if conf, ok := p.parsedIncludes[include]; ok {
-				// same file includes itself? don't blow up the parser
-				if conf == nil {
+
+			canonicalPath, err := filepath.Abs(filepath.Clean(matchedPath))
+			if err != nil {
+				if p.opts.skipIncludeParsingErr {
 					continue
 				}
-			} else {
-				p.parsedIncludes[include] = nil
+				return nil, err
 			}
 
-			parser, err := NewParser(includePath,
+			if _, inStack := p.includeStack[canonicalPath]; inStack {
+				if p.opts.includeCycleErr && !p.opts.skipIncludeParsingErr {
+					return nil, fmt.Errorf("include cycle detected for %s", canonicalPath)
+				}
+				// cyclic include graph, skip this branch and continue.
+				continue
+			}
+
+			if cached, ok := p.parsedIncludes[canonicalPath]; ok {
+				if cached != nil {
+					include.Configs = append(include.Configs, cached)
+				}
+				continue
+			}
+
+			p.includeStack[canonicalPath] = struct{}{}
+
+			parser, err := NewParser(canonicalPath,
 				WithSameOptions(p),
 				withParsedIncludes(p.parsedIncludes),
+				withIncludeStack(p.includeStack),
 				withConfigRoot(p.configRoot),
 			)
-
-			if err != nil && !p.opts.skipIncludeParsingErr {
-				panic(err)
+			if err != nil {
+				delete(p.includeStack, canonicalPath)
+				if p.opts.skipIncludeParsingErr {
+					continue
+				}
+				return nil, err
 			}
 
 			config, err := parser.Parse()
+			delete(p.includeStack, canonicalPath)
 			if err != nil {
+				if p.opts.skipIncludeParsingErr {
+					continue
+				}
 				return nil, err
 			}
+
 			//TODO: link parent config or include direcitve?
-			p.parsedIncludes[include] = config
+			p.parsedIncludes[canonicalPath] = config
 			include.Configs = append(include.Configs, config)
 		}
 	}
 	return include, nil
+}
+
+func hasGlobMeta(path string) bool {
+	return strings.ContainsAny(path, "*?[")
+}
+
+func pathHasHiddenBaseName(path string) bool {
+	base := filepath.Base(filepath.Clean(path))
+	return strings.HasPrefix(base, ".")
 }
 
 // Close closes the file handler and releases the resources

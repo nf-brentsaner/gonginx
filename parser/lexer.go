@@ -3,6 +3,7 @@ package parser
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
 
@@ -17,6 +18,7 @@ type lexer struct {
 	column     int
 	inLuaBlock bool
 	Latest     token.Token
+	Err        error
 }
 
 // lex initializes a lexer from string conetnt
@@ -34,6 +36,11 @@ func newLexer(r io.Reader) *lexer {
 
 // Scan gives you next token
 func (s *lexer) scan() token.Token {
+	if s.Err != nil {
+		s.Latest = s.NewToken(token.EOF).Lit("")
+		return s.Latest
+	}
+
 	s.Latest = s.getNextToken()
 	return s.Latest
 }
@@ -75,6 +82,8 @@ reToken:
 		return s.NewToken(token.BlockEnd).Lit(string(s.read()))
 	case ch == '#':
 		return s.scanComment()
+	case isEndOfLine(ch):
+		return s.NewToken(token.EndOfLine).Lit(string(s.read()))
 	case isQuote(ch):
 		return s.scanQuotedString(ch)
 	default:
@@ -96,9 +105,16 @@ func (s *lexer) readUntil(until runeCheck) string {
 	buf.WriteRune(s.read())
 
 	for {
-		if ch := s.peek(); isEOF(ch) {
+		ch := s.peek()
+		if isEOF(ch) {
 			break
 		} else if until(ch) {
+			// Check if this is a $ followed by a variable like ${var}
+			// If so, don't break - this is part of the token
+			if ch == '}' && s.maybeLookingAtVariableClose() {
+				buf.WriteRune(s.read())
+				continue
+			}
 			break
 		} else {
 			buf.WriteRune(s.read())
@@ -106,6 +122,21 @@ func (s *lexer) readUntil(until runeCheck) string {
 	}
 
 	return buf.String()
+}
+
+// maybeLookingAtVariableClose checks if we're possibly inside a variable reference
+// This is a heuristic to determine if a closing brace is part of a variable reference
+func (s *lexer) maybeLookingAtVariableClose() bool {
+	// Try to peek ahead to see if this looks like a variable pattern
+
+	// Read and immediately unread to preserve our position
+	s.reader.ReadRune()
+	ch := s.peek()
+	s.reader.UnreadRune()
+
+	// If the next character after } is $, 1-9, or a letter, we might be in a variable context
+	return ch == '$' || (ch >= '0' && ch <= '9') ||
+		(ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
 }
 
 // NewToken creates a new Token with its line and column
@@ -150,7 +181,8 @@ func (s *lexer) scanLuaCode() token.Token {
 	for {
 		ch := s.read()
 		if ch == rune(token.EOF) {
-			panic("unexpected end of file while scanning a string, maybe an unclosed lua code?")
+			s.setErrOnce("unexpected end of file while scanning lua code starting at line %d, column %d", ret.Line, ret.Column)
+			return s.NewToken(token.EOF).Lit("")
 		}
 		if ch == '#' {
 			code.WriteRune(ch)
@@ -176,7 +208,7 @@ func (s *lexer) scanLuaCode() token.Token {
 
 /*
 *
-\” – To escape “ within double quoted string.
+\” – To escape " within double quoted string.
 \\ – To escape the backslash.
 \n – To add line breaks between string.
 \t – To add tab space.
@@ -190,7 +222,8 @@ func (s *lexer) scanQuotedString(delimiter rune) token.Token {
 		ch := s.read()
 
 		if ch == rune(token.EOF) {
-			panic("unexpected end of file while scanning a string, maybe an unclosed quote?")
+			s.setErrOnce("unexpected end of file while scanning quoted string starting at line %d, column %d", tok.Line, tok.Column)
+			return s.NewToken(token.EOF).Lit("")
 		}
 
 		if ch == '\\' && (s.peek() == delimiter) {
@@ -213,26 +246,43 @@ func (s *lexer) scanKeyword() token.Token {
 	tok := s.NewToken(token.Keyword)
 	prev := s.read()
 	buf.WriteRune(prev)
+	inVarRef := false
+
 	for {
 		ch := s.peek()
 
-		//space, ;  and file ending definitely ends the keyword.
-		if isSpace(ch) || isEOF(ch) || ch == ';' {
+		// Space, semicolon, and file ending definitely end the keyword
+		if isSpace(ch) || isEOF(ch) || ch == ';' || isEndOfLine(ch) {
 			break
 		}
 
-		//the keyword could contain a variable with like ${var}
+		// Block start character ends the keyword unless we're in a variable reference
 		if ch == '{' {
 			if prev == '$' {
-				buf.WriteString(s.readUntil(func(r rune) bool {
-					return r == '}'
-				}))
-				buf.WriteRune(s.read()) //consume latest '}'
+				// Starting a ${var} variable reference
+				inVarRef = true
+				buf.WriteRune(s.read()) // consume '{'
+			} else if !inVarRef {
+				// This is a real block start, end the keyword
+				break
 			} else {
+				// Otherwise, just consume it as part of the keyword
+				buf.WriteRune(s.read())
+			}
+		} else if ch == '}' {
+			if inVarRef {
+				// End of the variable reference
+				inVarRef = false
+				buf.WriteRune(s.read()) // consume '}'
+			} else {
+				// This is a real block end, end the keyword
 				break
 			}
+		} else {
+			// Any other character is part of the keyword
+			prev = s.read()
+			buf.WriteRune(prev)
 		}
-		buf.WriteRune(s.read())
 	}
 
 	return tok.Lit(buf.String())
@@ -258,7 +308,7 @@ func isQuote(ch rune) bool {
 }
 
 func isSpace(ch rune) bool {
-	return ch == ' ' || ch == '\t' || isEndOfLine(ch)
+	return ch == ' ' || ch == '\t'
 }
 
 func isEOF(ch rune) bool {
@@ -271,4 +321,12 @@ func isEndOfLine(ch rune) bool {
 
 func isLuaBlock(t token.Token) bool {
 	return t.Type == token.Keyword && strings.HasSuffix(t.Literal, "_by_lua_block")
+}
+
+func (s *lexer) setErrOnce(format string, args ...any) {
+	if s.Err != nil {
+		return
+	}
+
+	s.Err = fmt.Errorf(format, args...)
 }

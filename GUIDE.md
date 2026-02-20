@@ -1,7 +1,17 @@
 # Gonginx Guide
 
-## Quick Start 
-you can find the all example in [examples](/examples)
+This guide explains how to parse, modify and regenerate Nginx configuration
+files with Gonginx. The [examples](./examples) directory contains runnable
+programs showing each feature.
+
+## Table of Contents
+- [Quick Start](#quick-start)
+- [Tips for Coding Agents](#tips-for-coding-agents)
+- [Examples](#examples)
+- [Library Reference](#library-reference)
+
+## Quick Start
+You can find all examples in [examples](./examples).
 ### Parse nginx config file
 Parse Nginx config file, Get server listen port
 ```go
@@ -111,10 +121,50 @@ location / { proxy_pass http://big_server_com; } } }`
 	// dump config with indented style
 	dumpConfigToFile(fullConf, "nginx-temp.conf")
 
-	// dump config to file whit indented style
-	dumpAndWriteConfigFile(fullConf, "./nginx-temp2.conf")
+        // dump config to file with indented style
+        dumpAndWriteConfigFile(fullConf, "./nginx-temp2.conf")
 }
 ```
+
+## Tips for Coding Agents
+The Gonginx API exposes small, composable functions. Prefer operating on
+`config.Config` objects and helper methods like `FindDirectives` or `AddServer`
+instead of editing raw text.
+
+## Behavior Notes
+
+### Error Model
+- Parsing malformed input returns errors.
+- Lexer/parser malformed-input paths should not panic.
+
+### Include Parsing
+- Enable include parsing with `parser.WithIncludeParsing()`.
+- Includes are deduplicated by canonical file path.
+- Cyclic include branches are skipped by default to prevent recursion loops.
+- Use `parser.WithIncludeCycleErr()` to return an explicit error on cycle detection.
+
+### Dump Sorting
+- Sorted dump styles only affect output rendering order.
+- Sorted dumps do not mutate in-memory directive order.
+
+### Parent Pointers
+- Root-level leaf directives have `nil` parent.
+- Nested directives reference their enclosing wrapper/directive as parent.
+- This is a hard behavior switch with no compatibility flag.
+
+### Upstream Lookup Modes
+- `FindUpstreams()` is permissive and skips unexpected types.
+- `FindUpstreamsStrict()` returns a typed error for unexpected upstream directive types.
+
+## Examples
+
+The `examples` directory contains small programs you can run directly. Useful
+entries include:
+
+- `adding-server` – append a server to an upstream block.
+- `update-directive` – modify a directive in place.
+- `dump-nginx-config` – format and write a full configuration.
+- `update-server-listen-port` – change the listen port of an existing server.
 
 ### Add server in upstream
 ```go
@@ -138,6 +188,50 @@ func main() {
 			"weight": "5",
 		},
 		Flags: []string{"down"},
+	})
+
+	fmt.Println(dumper.DumpBlock(conf.Block, dumper.IndentedStyle))
+}
+```
+
+### Add location in server
+```go
+func main() {
+	p := parser.NewStringParser(`http{
+	server{
+		listen 80;
+	}
+}`)
+
+	conf, err := p.Parse()
+	if err != nil {
+		panic(err)
+	}
+
+	servers := conf.FindDirectives("server")
+	if len(servers) == 0 {
+		panic("no server block found")
+	}
+
+	server, ok := servers[0].(*config.Server)
+	if !ok {
+		panic("server directive type mismatch")
+	}
+
+	server.AddLocation(&config.Location{
+		Directive: &config.Directive{
+			Name:       "location",
+			Parameters: []config.Parameter{{Value: "/api"}},
+			Block: &config.Block{
+				Directives: []config.IDirective{
+					&config.Directive{
+						Name:       "proxy_pass",
+						Parameters: []config.Parameter{{Value: "http://127.0.0.1:5000"}},
+					},
+				},
+			},
+		},
+		Match: "/api",
 	})
 
 	fmt.Println(dumper.DumpBlock(conf.Block, dumper.IndentedStyle))
@@ -318,7 +412,7 @@ func main() {
 
 ## Library Reference
 ### Parser
-Parser is the main package that analyzes and turns nginx structred files into objects. It basically has 3 libraries, `lexer` explodes it into `token`s and `parser` turns tokens into config objects which are in their own package.
+Parser is the main package that analyzes and turns nginx structured files into objects. It basically has three pieces: `lexer` breaks the file into tokens and `parser` converts tokens into configuration objects defined in the `config` package.
 
 #### ```NewParser(filePath string, opts ...Option) (*Parser, error)```
 + filePath is the path to the nginx config file.
@@ -335,6 +429,7 @@ Parser is the main package that analyzes and turns nginx structred files into ob
 + **WithDefaultOptions()**: WithDefaultOptions default options
 + **WithSkipComments()**: If this option is set, the parser will not parse comments.
 + **WithIncludeParsing()**: If this option is set, the parser will parse includes.
++ **WithIncludeCycleErr()**: If this option is set, parser returns an error when include cycle is detected.
 + **WithCustomDirectives(directives ...string)**: If this option is set, the parser will parse custom directives without validation.
 + **WithSkipValidBlocks(blocks ...string)**: If this option is set, the parser will not validate directives that are within blocks(recursive)
 + **WithSkipValidDirectivesErr()**: If this option is set, the parser will not return an error if it encounters an invalid directive.
@@ -349,7 +444,7 @@ Parse parses the config file(or from config strings) and returns a config object
 
 ----
 ### Config
-Config package is representation of any context, directive or their parameters in golang. So basically they are models and also AST。
+The `config` package models contexts and directives in Go and forms the AST.
 
 #### ```func (c *Config) FindDirectives(directiveName string) []IDirective```
 FindDirectives finds all directives with the given name.
@@ -368,6 +463,17 @@ type IDirective interface {
 	GetParent() IDirective
 }
 ```
+
+## Migration Notes
+
+If you are upgrading code that depended on older parser/dumper behavior:
+
+- Parent pointer assumptions:
+  - root-level leaf directives now have `nil` parent rather than self-reference.
+- Include parsing now skips cyclic branches and deduplicates parsed include files by canonical path.
+- If you need strict cycle handling, enable `WithIncludeCycleErr()` and treat cycle detection as a parse error.
+- Sorted dump operations do not reorder your in-memory AST anymore.
+- Lua dump preserves string literal semantics and falls back to original code if formatting fails.
 + GetName() string: the directive name.
 + GetParameters() []string: the directive parameters.
 + GetBlock() IBlock: the directive block.
@@ -453,6 +559,7 @@ type Server struct {
 	Parent  IBlock
 }
 ```
++ ```func (s *Server) AddLocation(location *Location)```
 ---
 ### Dumper
 Dumper is the package that holds styling configuration only. 
@@ -481,8 +588,12 @@ type Style struct {
 	StartIndent       int
 	Indent            int
 	Debug             bool
+	DisableLuaFormatting bool
+	LuaFormatter         LuaFormatterFunc
 }
 ```
++ `func (s *Style) WithLuaFormatting(enabled bool) *Style`
++ `func (s *Style) WithLuaFormatter(formatter LuaFormatterFunc) *Style`
 #### Styles by default
 + NoIndentStyle
 ```go
